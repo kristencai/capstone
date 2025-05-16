@@ -5,3 +5,10 @@ ds2_dense/images/
 ds2_dense/instance/
 
 ds2_dense/segmentation
+
+vis_preds
+
+ds2_dense/deepscores_test.json
+
+ds2_dense/deepscores_train.json
+

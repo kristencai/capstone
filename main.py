@@ -1,10 +1,7 @@
 import torch
 from torch.utils.data import DataLoader, Dataset, random_split
 from torchvision.transforms import ToTensor, Resize, Compose, Normalize
-from torchvision.models.detection import (
-    fasterrcnn_mobilenet_v3_large_fpn,
-    FasterRCNN_MobileNet_V3_Large_FPN_Weights
-)
+from torchvision.models.detection import (fasterrcnn_mobilenet_v3_large_fpn, FasterRCNN_MobileNet_V3_Large_FPN_Weights)
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from torch.cuda.amp import autocast, GradScaler
 from PIL import Image
@@ -18,16 +15,26 @@ import matplotlib.patches as patches
 
 class DeepScoresDataset(Dataset):
     def __init__(self, imgs_dir, ann_file, transforms=None):
-        print("Initializing dataset...")
         self.imgs_dir = imgs_dir
         coco = json.load(open(ann_file))
+        self.cat_idx = {}
+        categories = coco.get('categories', [])
+        for i, c in enumerate(categories):
+            category_id = c['id']
+            mapped_label = i + 1
+            self.cat_idx[category_id] = mapped_label
 
-        # remap category IDs 
-        self.cat2idx = {c['id']: i + 1 for i, c in enumerate(coco.get('categories', []))}
-        self.num_categories = len(self.cat2idx)
+        self.num_categories = len(self.cat_idx)
 
-        self.images = {img['id']: img.get('file_name', img.get('filename'))
-                       for img in coco.get('images', [])}
+        self.images = {}
+        for img in coco.get('images', []):
+            img_id = img['id']
+            if 'file_name' in img:
+                fname = img['file_name']
+            else:
+                fname = img.get('filename')
+            self.images[img_id] = fname
+
         self.anns_per_img = {}
         for ann in coco.get('annotations', []):
             self.anns_per_img.setdefault(ann['image_id'], []).append(ann)
@@ -52,7 +59,7 @@ class DeepScoresDataset(Dataset):
             if w <= 0 or h <= 0:
                 continue
             boxes.append([x, y, x + w, y + h])
-            labels.append(self.cat2idx[ann['category_id']])
+            labels.append(self.cat_idx[ann['category_id']])
 
         boxes = torch.tensor(boxes, dtype=torch.float32)
         labels = torch.tensor(labels, dtype=torch.int64)
@@ -63,23 +70,19 @@ class DeepScoresDataset(Dataset):
         scale_x, scale_y = new_w / orig_w, new_h / orig_h
         boxes *= torch.tensor([scale_x, scale_y, scale_x, scale_y])
 
-        target = {
-            "boxes": boxes,
-            "labels": labels,
-            "image_id": torch.tensor([img_id])
-        }
+        target = {"boxes": boxes, "labels": labels, "image_id": torch.tensor([img_id])}
         return img, target
 
-
 def collate_fn(batch):
-    return tuple(zip(*batch))
-
+    images = [item[0] for item in batch]   
+    targets = [item[1] for item in batch]  
+    return images, targets
 
 def visualize_predictions(model, dataloader, device,
                           save_dir="vis_preds", num_images=5, score_thresh=0.5):
     os.makedirs(save_dir, exist_ok=True)
     model.eval()
-    print(f"Visualizing predictions (threshold={score_thresh})...")
+    print(f"Visualizing predictions:")
 
     count = 0
     with torch.no_grad():
@@ -92,16 +95,13 @@ def visualize_predictions(model, dataloader, device,
                 fig, ax = plt.subplots(1)
                 ax.imshow(img_np)
 
-                for box, score, label in zip(pred["boxes"],
-                                             pred["scores"],
-                                             pred["labels"]):
+                for box, score, label in zip(pred["boxes"], pred["scores"], pred["labels"]):
                     if score < score_thresh:
                         continue
                     x1, y1, x2, y2 = box.cpu()
                     rect = patches.Rectangle(
                         (x1, y1), x2 - x1, y2 - y1,
-                        linewidth=2, edgecolor="lime", facecolor="none"
-                    )
+                        linewidth=2, edgecolor="lime", facecolor="none")
                     ax.add_patch(rect)
                     ax.text(x1, y1, f"{label.item()}:{score:.2f}",
                             color="lime", fontsize=8)
@@ -122,19 +122,16 @@ def main():
     train_json = "ds2_dense/deepscores_train_coco.json"
     test_json = "ds2_dense/deepscores_test_coco.json"
 
-    # ImageNet normalization
     mean = [0.485, 0.456, 0.406]
     std = [0.229, 0.224, 0.225]
     transforms = Compose([
         Resize((512, 512)),
         ToTensor(),
-        Normalize(mean=mean, std=std),
-    ])
-
+        Normalize(mean=mean, std=std)])
 
     full_ds = DeepScoresDataset(img_dir, train_json, transforms=transforms)
-    idx2cat = {v: k for k, v in full_ds.cat2idx.items()}
-    num_classes = full_ds.num_categories + 1  # include background class
+    idx_cat = {v: k for k, v in full_ds.cat_idx.items()}
+    num_classes = full_ds.num_categories + 1  
 
     total = len(full_ds)
     val_size = int(0.2 * total)
@@ -142,16 +139,13 @@ def main():
     train_ds, val_ds = random_split(full_ds, [train_size, val_size])
     train_loader = DataLoader(
         train_ds, batch_size=8, shuffle=True,
-        collate_fn=collate_fn, num_workers=0, pin_memory=True
-    )
+        collate_fn=collate_fn, num_workers=0, pin_memory=True)
     val_loader = DataLoader(
         val_ds, batch_size=8, shuffle=False,
-        collate_fn=collate_fn, num_workers=0, pin_memory=True
-    )
+        collate_fn=collate_fn, num_workers=0, pin_memory=True)
 
     model = fasterrcnn_mobilenet_v3_large_fpn(
-        weights=FasterRCNN_MobileNet_V3_Large_FPN_Weights.DEFAULT,
-    )
+        weights=FasterRCNN_MobileNet_V3_Large_FPN_Weights.DEFAULT,)
     in_features = model.roi_heads.box_predictor.cls_score.in_features
     model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
 
@@ -163,10 +157,8 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
-    optimizer = torch.optim.SGD(
-        [p for p in model.parameters() if p.requires_grad],
-        lr=0.007, momentum=0.9, weight_decay=0.0005
-    )
+    optimizer = torch.optim.SGD([p for p in model.parameters() if p.requires_grad],
+        lr=0.007, momentum=0.9, weight_decay=0.0005)
     scaler = GradScaler()
 
     num_epochs = 40
@@ -186,7 +178,7 @@ def main():
             scaler.update()
             train_loss += loss.item()
             if i % 10 == 0:
-                print(f"  Batch {i}: Loss = {loss.item():.4f}")
+                print(f"Batch {i}: Loss = {loss.item():.4f}")
 
         val_loss = 0.0
         with torch.no_grad():
@@ -197,16 +189,15 @@ def main():
                     losses = model(imgs, targets)
                 val_loss += sum(losses.values()).item()
 
-        print(f"Epoch {epoch}/{num_epochs} - "
-              f"Train Loss: {train_loss/len(train_loader):.4f} - "
+        print(f"Epoch {epoch}/{num_epochs} "
+              f"Train Loss: {train_loss/len(train_loader):.4f} "
               f"Val Loss: {val_loss/len(val_loader):.4f}")
 
 
     test_ds = DeepScoresDataset(img_dir, test_json, transforms=transforms)
     test_loader = DataLoader(
         test_ds, batch_size=8, shuffle=False,
-        collate_fn=collate_fn, num_workers=0, pin_memory=True
-    )
+        collate_fn=collate_fn, num_workers=0, pin_memory=True)
 
     model.eval()
     coco_gt = COCO(test_json)
@@ -220,19 +211,18 @@ def main():
                 img_info = coco_gt.loadImgs(image_id)[0]
                 orig_w, orig_h = img_info['width'], img_info['height']
                 scale_x, scale_y = orig_w / 512, orig_h / 512
-                for box, score, label in zip(pred['boxes'],
-                                             pred['scores'],
-                                             pred['labels']):
+                for box, score, label in zip(pred['boxes'], pred['scores'], pred['labels']):
                     x1, y1, x2, y2 = box.cpu().tolist()
-                    x1 *= scale_x; y1 *= scale_y
-                    x2 *= scale_x; y2 *= scale_y
-                    orig_cat = idx2cat[label.item()]
+                    x1 *= scale_x
+                    y1 *= scale_y
+                    x2 *= scale_x
+                    y2 *= scale_y
+                    orig_cat = idx_cat[label.item()]
                     coco_results.append({
                         "image_id": image_id,
                         "category_id": orig_cat,
                         "bbox": [x1, y1, x2 - x1, y2 - y1],
-                        "score": float(score)
-                    })
+                        "score": float(score)})
 
     with open('ds2_dense/test_preds.json', 'w') as f:
         json.dump(coco_results, f)
@@ -243,8 +233,10 @@ def main():
     coco_eval.accumulate()
     coco_eval.summarize()
 
+    visualize_predictions(model, test_loader, device,
+                          save_dir="vis_preds", num_images=5, score_thresh=0.5)
+
 
 
 if __name__ == '__main__':
     main()
-¯
